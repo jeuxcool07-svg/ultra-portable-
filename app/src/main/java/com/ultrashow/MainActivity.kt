@@ -2,10 +2,8 @@ package com.ultrashow
 
 import android.Manifest
 import android.app.Activity
-import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Color
-import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -14,210 +12,319 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.provider.Settings
+import android.text.Editable
+import android.text.InputFilter
+import android.text.InputType
+import android.text.TextWatcher
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : Activity() {
 
-    private val messages = arrayOf(
-        "Tout va bien",
-        "J'arrive",
-        "Ça va pas du tout",
-        "Au secours",
-        "Danger imminent"
-    )
+    private lateinit var modeSpinner: Spinner
+    private lateinit var speedSpinner: Spinner
+    private lateinit var input: EditText
+    private lateinit var counter: TextView
+    private lateinit var sendBtn: Button
+    private lateinit var listenBtn: Button
+    private lateinit var status: TextView
+    private lateinit var log: TextView
 
-    private var mode = 0
-    private val handler = Handler(Looper.getMainLooper())
-    private val decoder = Decoder { id, m -> onReceived(id, m) }
-
-    @Volatile private var sending = false
+    private val ui = Handler(Looper.getMainLooper())
+    private var decoder: Decoder? = null
+    private var logText = ""
     @Volatile private var listening = false
-    private var recordThread: Thread? = null
+    @Volatile private var sending = false
+    @Volatile private var sessionId = 0
 
-    private lateinit var modeButton: Button
-    private lateinit var listenButton: Button
-    private lateinit var statusText: TextView
-    private lateinit var receivedText: TextView
-    private lateinit var levelText: TextView
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private val refresher = object : Runnable {
-        override fun run() {
-            if (!listening) return
-            val sb = StringBuilder("Niveau du son reçu :\n")
-            for (m in 0 until Modem.FREQS.size) {
-                val db = decoder.levelDb(m)
-                val blocks = ((db + 100.0) / 8.0).toInt().coerceIn(0, 12)
-                sb.append(Modem.MODE_NAMES[m].padEnd(19))
-                sb.append("█".repeat(blocks))
-                sb.append("░".repeat(12 - blocks))
-                sb.append('\n')
-            }
-            levelText.text = sb.toString()
-            handler.postDelayed(this, 250)
-        }
+    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+
+    private fun label(t: String) = TextView(this).apply {
+        text = t
+        setPadding(0, dp(14), 0, dp(4))
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(dp(16), dp(24), dp(16), dp(24))
-
-        root.addView(label("Ultra Show", 28f, "#FFFFFF"), params(0))
-        root.addView(
-            label(
-                "Messages par le son, sans réseau. Mets le volume média au maximum sur le téléphone qui envoie.",
-                14f, "#94A3B8"
-            ),
-            params(4)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(32))
+        }
+        fun add(v: View) = root.addView(
+            v,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
         )
 
-        root.addView(label("ENVOYER", 14f, "#38BDF8"), params(24))
-        modeButton = makeButton(modeLabel(), "#475569") {
-            mode = (mode + 1) % Modem.FREQS.size
-            modeButton.text = modeLabel()
-        }
-        root.addView(modeButton, params(8))
-        for (i in messages.indices) {
-            root.addView(makeButton(messages[i], "#1D4ED8") { send(i) }, params(8))
-        }
+        add(TextView(this).apply {
+            text = "Ultra Show"
+            textSize = 24f
+        })
 
-        root.addView(label("RECEVOIR", 14f, "#38BDF8"), params(28))
-        listenButton = makeButton("Écouter", "#15803D") { toggleListen() }
-        root.addView(listenButton, params(8))
-
-        receivedText = label("Rien reçu pour l'instant", 22f, "#FACC15")
-        root.addView(receivedText, params(16))
-
-        levelText = label("", 13f, "#94A3B8")
-        levelText.typeface = Typeface.MONOSPACE
-        root.addView(levelText, params(12))
-
-        statusText = label("Prêt.", 14f, "#CBD5E1")
-        root.addView(statusText, params(12))
-
-        val scroll = ScrollView(this)
-        scroll.setBackgroundColor(Color.parseColor("#0F172A"))
-        scroll.addView(root)
-        setContentView(scroll)
-    }
-
-    override fun onPause() {
-        super.onPause()
-        stopListening()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        stopListening()
-    }
-
-    // ---------- petits outils d'affichage ----------
-
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
-    private fun params(top: Int): LinearLayout.LayoutParams {
-        val p = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
+        add(label("Canal"))
+        modeSpinner = Spinner(this)
+        modeSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, Modem.MODE_NAMES
         )
-        p.topMargin = dp(top)
-        return p
-    }
+        add(modeSpinner)
 
-    private fun label(text: String, size: Float, color: String): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = size
-        t.setTextColor(Color.parseColor(color))
-        return t
-    }
+        add(label("Vitesse"))
+        speedSpinner = Spinner(this)
+        speedSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, Modem.SPEED_NAMES
+        )
+        add(speedSpinner)
 
-    private fun makeButton(text: String, color: String, onClick: () -> Unit): Button {
-        val b = Button(this)
-        b.text = text
-        b.setAllCaps(false)
-        b.setTextColor(Color.WHITE)
-        b.setBackgroundColor(Color.parseColor(color))
-        b.setOnClickListener { onClick() }
-        return b
-    }
-
-    private fun modeLabel(): String = "Mode d'envoi : ${Modem.MODE_NAMES[mode]}  (touche pour changer)"
-
-    private fun status(s: String) {
-        runOnUiThread { statusText.text = s }
-    }
-
-    // ---------- envoyer ----------
-
-    private fun send(id: Int) {
-        if (sending) return
-        sending = true
-        val samples = Modem.encode(mode, id)
-        val name = Modem.MODE_NAMES[mode]
-        status("Envoi de « ${messages[id]} » — $name")
-        Thread {
-            var track: AudioTrack? = null
-            var error: String? = null
-            try {
-                val t = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(Modem.SAMPLE_RATE)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(samples.size * 2)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-                track = t
-                t.write(samples, 0, samples.size)
-                t.play()
-                Thread.sleep(samples.size * 1000L / Modem.SAMPLE_RATE + 300L)
-            } catch (e: Exception) {
-                error = e.message ?: "inconnue"
-            } finally {
-                try {
-                    track?.stop()
-                } catch (e: Exception) {
-                }
-                track?.release()
-                decoder.reset()
-                sending = false
+        add(label("Ton message"))
+        input = EditText(this).apply {
+            hint = "Écris ton message ici"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            imeOptions = EditorInfo.IME_ACTION_SEND
+            setHorizontallyScrolling(false)
+            maxLines = 3
+            filters = arrayOf(InputFilter { source, start, end, dest, dstart, dend ->
+                val next = dest.subSequence(0, dstart).toString() +
+                    source.subSequence(start, end) +
+                    dest.subSequence(dend, dest.length)
+                if (next.toByteArray(Charsets.UTF_8).size <= Modem.MAX_BYTES) null else ""
+            })
+        }
+        input.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEND) {
+                send()
+                true
+            } else {
+                false
             }
-            status(if (error == null) "Message envoyé." else "Erreur d'envoi : $error")
+        }
+        add(input)
+
+        counter = TextView(this).apply {
+            text = "0 / ${Modem.MAX_BYTES}"
+            gravity = Gravity.END
+        }
+        input.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                val n = (s?.toString() ?: "").toByteArray(Charsets.UTF_8).size
+                counter.text = "$n / ${Modem.MAX_BYTES}"
+            }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        add(counter)
+
+        sendBtn = Button(this).apply {
+            text = "Envoyer"
+            setOnClickListener { send() }
+        }
+        add(sendBtn)
+
+        listenBtn = Button(this).apply {
+            text = "Écouter"
+            setOnClickListener {
+                if (listening) {
+                    stopListening()
+                } else {
+                    startListening()
+                }
+            }
+        }
+        add(listenBtn)
+
+        status = TextView(this).apply {
+            text = "Prêt. Monte le volume média au maximum avant d'envoyer."
+            setPadding(0, dp(12), 0, dp(12))
+        }
+        add(status)
+
+        add(label("Messages reçus"))
+        log = TextView(this).apply {
+            text = "Aucun message reçu pour l'instant."
+            textSize = 16f
+        }
+        add(log)
+
+        add(Button(this).apply {
+            text = "Réglages d'accessibilité"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+        })
+
+        setContentView(ScrollView(this).apply {
+            fitsSystemWindows = true
+            addView(root)
+        })
+    }
+
+    // ---------- Envoi ----------
+
+    private fun send() {
+        if (sending) return
+        val bytes = input.text.toString().trim().toByteArray(Charsets.UTF_8)
+        if (bytes.isEmpty()) {
+            toast("Écris un message d'abord")
+            return
+        }
+        val mode = modeSpinner.selectedItemPosition
+        val speed = speedSpinner.selectedItemPosition
+        sending = true
+        sendBtn.isEnabled = false
+        status.text = "Préparation du son…"
+        Thread {
+            var result = "Message envoyé ✔"
+            try {
+                val pcm = Modem.encode(mode, speed, bytes)
+                val sec = pcm.size / Modem.SAMPLE_RATE
+                ui.post { status.text = "Envoi en cours… environ $sec s" }
+                playPcm(pcm)
+            } catch (e: Exception) {
+                result = "Erreur d'envoi : ${e.message}"
+            }
+            ui.post {
+                sending = false
+                sendBtn.isEnabled = true
+                status.text = result
+            }
         }.start()
     }
 
-    // ---------- recevoir ----------
-
-    private fun toggleListen() {
-        if (listening) {
-            stopListening()
-            return
+    private fun playPcm(pcm: ShortArray) {
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(Modem.SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(pcm.size * 2)
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .build()
+        try {
+            track.write(pcm, 0, pcm.size)
+            track.play()
+            Thread.sleep(pcm.size * 1000L / Modem.SAMPLE_RATE + 300)
+            track.stop()
+        } finally {
+            track.release()
         }
+    }
+
+    // ---------- Écoute ----------
+
+    private fun startListening() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
             return
         }
-        startListening()
+        val channel = AudioFormat.CHANNEL_IN_MONO
+        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        val minBuf = AudioRecord.getMinBufferSize(Modem.SAMPLE_RATE, channel, encoding)
+        val bufSize = maxOf(minBuf, Modem.CHUNK * 2 * 4)
+
+        var rec = AudioRecord(
+            MediaRecorder.AudioSource.UNPROCESSED, Modem.SAMPLE_RATE, channel, encoding, bufSize
+        )
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            rec = AudioRecord(
+                MediaRecorder.AudioSource.MIC, Modem.SAMPLE_RATE, channel, encoding, bufSize
+            )
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            toast("Micro indisponible")
+            return
+        }
+
+        val dec = Decoder { text, mode, ok ->
+            ui.post { showReceived(text, mode, ok) }
+        }
+        decoder = dec
+        listening = true
+        val id = ++sessionId
+        listenBtn.text = "Arrêter l'écoute"
+
+        Thread {
+            val buf = ShortArray(Modem.CHUNK)
+            try {
+                rec.startRecording()
+                while (listening && sessionId == id) {
+                    val n = rec.read(buf, 0, buf.size)
+                    if (n > 0) {
+                        dec.feed(buf, n)
+                    } else if (n < 0) {
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                // on s'arrete simplement
+            } finally {
+                try {
+                    rec.stop()
+                } catch (e: Exception) {
+                }
+                rec.release()
+            }
+        }.start()
+
+        ui.post(ticker)
+    }
+
+    private fun stopListening() {
+        listening = false
+        sessionId++
+        decoder?.reset()
+        decoder = null
+        listenBtn.text = "Écouter"
+        if (!sending) status.text = "Écoute arrêtée"
+    }
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            val d = decoder
+            if (!listening || d == null) return
+            if (!sending) {
+                val p = d.progress()
+                val db = d.levelDb(modeSpinner.selectedItemPosition).toInt()
+                val line = if (p >= 0) "Réception… $p %" else "À l'écoute — niveau $db dB"
+                status.text = line
+            }
+            ui.postDelayed(this, 250)
+        }
+    }
+
+    private fun showReceived(text: String, mode: Int, ok: Boolean) {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        val warn = if (ok) "" else " ⚠ message abîmé"
+        logText = "[$time] ${Modem.MODE_NAMES[mode]}$warn\n$text\n\n$logText"
+        log.text = logText
     }
 
     override fun onRequestPermissionsResult(
@@ -226,89 +333,16 @@ class MainActivity : Activity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1 && grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        if (requestCode == 1 && granted) {
             startListening()
         } else {
-            status("Permission du micro refusée : impossible d'écouter.")
+            toast("Il faut autoriser le micro pour écouter")
         }
     }
 
-    private fun startListening() {
-        if (listening) return
-        val channel = AudioFormat.CHANNEL_IN_MONO
-        val enc = AudioFormat.ENCODING_PCM_16BIT
-        val minBuf = AudioRecord.getMinBufferSize(Modem.SAMPLE_RATE, channel, enc)
-        val bufSize = maxOf(minBuf, Modem.SAMPLE_RATE)
-
-        var found: AudioRecord? = null
-        val sources = intArrayOf(MediaRecorder.AudioSource.UNPROCESSED, MediaRecorder.AudioSource.MIC)
-        for (src in sources) {
-            if (found != null) break
-            try {
-                val r = AudioRecord(src, Modem.SAMPLE_RATE, channel, enc, bufSize)
-                if (r.state == AudioRecord.STATE_INITIALIZED) {
-                    found = r
-                } else {
-                    r.release()
-                }
-            } catch (e: Exception) {
-            }
-        }
-        val rec: AudioRecord = found ?: run {
-            status("Impossible d'ouvrir le micro.")
-            return
-        }
-
-        decoder.reset()
-        rec.startRecording()
-        listening = true
-        listenButton.text = "Arrêter l'écoute"
-        receivedText.text = "J'écoute…"
-        status("Écoute en cours. L'autre téléphone peut envoyer.")
-        handler.post(refresher)
-
-        val t = Thread {
-            val buf = ShortArray(2048)
-            while (listening) {
-                val n = rec.read(buf, 0, buf.size)
-                if (n < 0) break
-                if (n > 0 && !sending) decoder.feed(buf, n)
-            }
-            try {
-                rec.stop()
-            } catch (e: Exception) {
-            }
-            rec.release()
-        }
-        recordThread = t
-        t.start()
-    }
-
-    private fun stopListening() {
-        if (!listening) return
-        listening = false
-        handler.removeCallbacks(refresher)
-        recordThread?.join(500)
-        recordThread = null
-        listenButton.text = "Écouter"
-        levelText.text = ""
-        status("Écoute arrêtée.")
-    }
-
-    private fun onReceived(id: Int, m: Int) {
-        runOnUiThread {
-            val text = if (id in messages.indices) messages[id] else "Message inconnu ($id)"
-            receivedText.text = "Reçu : $text"
-            status("Message reçu en mode : ${Modem.MODE_NAMES[m]}")
-            vibrate()
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun vibrate() {
-        val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-        v.vibrate(VibrationEffect.createOneShot(600, VibrationEffect.DEFAULT_AMPLITUDE))
+    override fun onStop() {
+        super.onStop()
+        if (listening) stopListening()
     }
 }
